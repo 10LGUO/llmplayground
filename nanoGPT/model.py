@@ -52,11 +52,17 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
+        if not getattr(self, '_shape_printed', False):
+            print(f"  [Attn] x:                   {tuple(x.shape)}")
+
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        if not getattr(self, '_shape_printed', False):
+            print(f"  [Attn] q, k, v (per head):  {tuple(q.shape)}")
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -68,11 +74,24 @@ class CausalSelfAttention(nn.Module):
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
+            if not getattr(self, '_shape_printed', False):
+                print(f"  [Attn] att:                 {tuple(att.shape)}")
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
+        if not getattr(self, '_shape_printed', False):
+            print(f"  [Attn] y (out):             {tuple(y.shape)}")
+            self._shape_printed = True
+
+        # KV cache size during inference (note: nanoGPT does not cache — recomputes every step)
+        if not self.training:
+            kv_bytes = (k.nelement() + v.nelement()) * k.element_size()
+            print(f"  [KV]   k: {tuple(k.shape)}  v: {tuple(v.shape)}  "
+                  f"(per layer, recomputed each step — no cache)  "
+                  f"size: {kv_bytes / 1024:.1f} KB")
+
         return y
 
 class MLP(nn.Module):
@@ -85,10 +104,18 @@ class MLP(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
+        if not getattr(self, '_shape_printed', False):
+            print(f"  [MLP]  x (in):              {tuple(x.shape)}")
         x = self.c_fc(x)
+        if not getattr(self, '_shape_printed', False):
+            print(f"  [MLP]  x after fc (4*C):    {tuple(x.shape)}")
         x = self.gelu(x)
         x = self.c_proj(x)
+        if not getattr(self, '_shape_printed', False):
+            print(f"  [MLP]  x after proj (C):    {tuple(x.shape)}")
         x = self.dropout(x)
+        if not getattr(self, '_shape_printed', False):
+            self._shape_printed = True
         return x
 
 class Block(nn.Module):
@@ -101,8 +128,15 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
+        if not getattr(self, '_shape_printed', False):
+            print(f" [Block] x (in):              {tuple(x.shape)}")
         x = x + self.attn(self.ln_1(x))
+        if not getattr(self, '_shape_printed', False):
+            print(f" [Block] x after attn+resid:  {tuple(x.shape)}")
         x = x + self.mlp(self.ln_2(x))
+        if not getattr(self, '_shape_printed', False):
+            print(f" [Block] x after mlp+resid:   {tuple(x.shape)}")
+            self._shape_printed = True
         return x
 
 @dataclass
@@ -173,13 +207,27 @@ class GPT(nn.Module):
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
+        if not getattr(self, '_shape_printed', False):
+            print(f"[GPT]  idx:                   {tuple(idx.shape)}")
+            print(f"[GPT]  pos:                   {tuple(pos.shape)}")
+
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+
+        if not getattr(self, '_shape_printed', False):
+            print(f"[GPT]  tok_emb:               {tuple(tok_emb.shape)}")
+            print(f"[GPT]  pos_emb:               {tuple(pos_emb.shape)}")
+            print(f"[GPT]  x (tok+pos, dropped):  {tuple(x.shape)}")
+            print(f"[GPT]  --- block 0 ---")
+
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
+
+        if not getattr(self, '_shape_printed', False):
+            print(f"[GPT]  x after ln_f:          {tuple(x.shape)}")
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
@@ -189,6 +237,12 @@ class GPT(nn.Module):
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
+
+        if not getattr(self, '_shape_printed', False):
+            print(f"[GPT]  logits:                {tuple(logits.shape)}")
+            if targets is not None:
+                print(f"[GPT]  targets:               {tuple(targets.shape)}")
+            self._shape_printed = True
 
         return logits, loss
 
